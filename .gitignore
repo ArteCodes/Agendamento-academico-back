@@ -1,0 +1,72 @@
+# ===== Crucial: Variáveis de Ambiente e Credenciais =====
+.env
+.env.*
+!.env.example
+firebase-credentials.json
+*.pem
+*.key
+*.secrets
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyw
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruamel.yaml
+
+# ===== IDEs e Editors =====
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ===== Ambientes Virtuais =====
+.venv/
+venv/
+ENV/
+env/
+bin/
+lib/
+lib64/
+include/
+share/
+
+# ===== Frontend (Vue.js) =====
+node_modules/
+dist/
+build/
+.nitro/
+.output/
+.cache/
+.nuxt/
+
+# ===== Logs e Temporários =====
+*.log
+tmp/
+temp/
+cache/
+*.pid
+*.log.*
+
+# ===== Compilados e Builds =====
+*.wasm
+*.wasm.map
+
+# ===== Dependências de teste =====
+htmlcov/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== Flask/Django (caso futuro) =====
+staticfiles/
+media/
+

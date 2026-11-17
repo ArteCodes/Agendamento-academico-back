@@ -11,8 +11,8 @@ def verify_firebase_token(credentials: HTTPAuthorizationCredentials = Depends(se
     """
     token = credentials.credentials
     try:
-        # Decodifica o token enviado do Vue.js
-        decoded_token = auth.verify_id_token(token)
+        # clock_skew_seconds tolera pequenos desvios entre o relógio local e o do Firebase.
+        decoded_token = auth.verify_id_token(token, clock_skew_seconds=30)
         return decoded_token  # Retorna o dicionário com 'uid', 'email', etc.
     except Exception as e:
         raise HTTPException(

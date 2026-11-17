@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import auth, teste_banco, usuarios
+from app.routers import auth, teste_banco, agendamentos, horarios
 
 app = FastAPI(
     title="Sistema de Agendamento e Triagem",
@@ -22,10 +22,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inclui as rotas de autenticação
-app.include_router(auth.router)
-app.include_router(teste_banco.router)
-app.include_router(usuarios.router)
+# Inclui as rotas com prefixo /api
+app.include_router(auth.router, prefix="/api")
+app.include_router(teste_banco.router, prefix="/api")
+app.include_router(agendamentos.router, prefix="/api")
+app.include_router(horarios.router, prefix="/api")
 
 @app.get("/")
 def read_root():

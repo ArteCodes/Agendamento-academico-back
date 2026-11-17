@@ -30,9 +30,8 @@ MENSAGEM_HORARIO_OCUPADO = (
     "para marcar um novo agendamento."
 )
 
-# Campos fora do formulário novo, mas obrigatórios no schema atual de agendamentos.
+# Campo fora do formulário novo, mas obrigatório no schema atual de agendamentos.
 NOME_ATENDIMENTO_PADRAO = "Atendimento com coordenador"
-LOCAL_PADRAO = "Sala de Atendimento"
 
 DIAS_PADRAO = 7
 DIAS_MAXIMO = 14
@@ -325,7 +324,7 @@ def listar_horarios_fluxo(
     ocupados = {
         (str(item.get("data")), item.get("horario"))
         for item in agendamentos
-        if item.get("status") != "Cancelado"
+        if item.get("status") not in ("Cancelado", "Redirecionado")
     }
 
     bloqueios = (
@@ -485,7 +484,6 @@ def confirmar_agendamento(
             "p_telefone": confirmacao.telefone.strip(),
             "p_descricao": confirmacao.descricao.strip(),
             "p_nome_atendimento": NOME_ATENDIMENTO_PADRAO,
-            "p_local": LOCAL_PADRAO,
         },
     )
 

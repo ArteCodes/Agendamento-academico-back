@@ -1,11 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from typing import Optional
-from pydantic import BaseModel
+from typing import Literal, Optional
+from pydantic import BaseModel, Field
 
 from app.database import supabase
 from app.dependencies.auth import verify_firebase_token
 
 router = APIRouter(prefix="/agendamentos", tags=["Agendamentos"])
+
+STATUS_FINAIS = ("Cancelado", "Redirecionado")
 
 
 class AgendamentoCreate(BaseModel):
@@ -16,7 +18,6 @@ class AgendamentoCreate(BaseModel):
     nome: str
     data: str
     horario: str
-    local: str
     descricao: Optional[str] = None
     curso: Optional[str] = None
     periodo: Optional[str] = None
@@ -34,7 +35,6 @@ class AgendamentoResponse(BaseModel):
     nome: str
     data: str
     horario: str
-    local: str
     status: str
     descricao: Optional[str] = None
     curso: Optional[str] = None
@@ -44,6 +44,22 @@ class AgendamentoResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DesvalidarAgendamento(BaseModel):
+    status: Literal["Cancelado", "Redirecionado"]
+    observacao: str = Field(min_length=1, max_length=2000)
+
+
+class ObservacaoResponse(BaseModel):
+    id: int
+    agendamento_id: int
+    usuario_id: Optional[int] = None
+    usuario_nome: Optional[str] = None
+    status_anterior: Optional[str] = None
+    status_novo: str
+    observacao: str
+    criado_em: str
 
 
 def _tipo_usuario(usuario: dict) -> str:
@@ -110,6 +126,31 @@ def _buscar_agendamento(agendamento_id: int) -> dict:
     return dados[0]
 
 
+def _pode_ver_agendamento(usuario: dict, agendamento: dict) -> bool:
+    """
+    Regra de visibilidade:
+    - suporte: todos os agendamentos;
+    - aluno: apenas os próprios (criador, matrícula ou e-mail);
+    - coordenador: apenas os destinados a ele (coordinator_id).
+    """
+    tipo = _tipo_usuario(usuario)
+    user_id = usuario.get("id")
+
+    if tipo == "suporte":
+        return True
+    if tipo == "aluno":
+        matricula = usuario.get("matricula")
+        email = (usuario.get("email") or "").lower()
+        return (
+            agendamento.get("created_by") == user_id
+            or (matricula and agendamento.get("aluno_matricula") == matricula)
+            or (agendamento.get("alunoEmail") or "").lower() == email
+        )
+    if tipo == "coordenador":
+        return agendamento.get("coordinator_id") == user_id
+    return False
+
+
 @router.get("", response_model=list[AgendamentoResponse])
 def listar_agendamentos(token_data: dict = Depends(verify_firebase_token)):
     usuario = _get_usuario_logado(token_data)
@@ -131,7 +172,8 @@ def listar_agendamentos(token_data: dict = Depends(verify_firebase_token)):
     elif tipo == "coordenador":
         filtrados = [a for a in todos if a.get("coordinator_id") == user_id]
     elif tipo == "suporte":
-        filtrados = [a for a in todos if a.get("created_by") == user_id]
+        # Suporte acompanha todos os agendamentos do sistema.
+        filtrados = todos
     else:
         filtrados = []
 
@@ -145,30 +187,60 @@ def obter_agendamento(
 ):
     agendamento = _buscar_agendamento(agendamento_id)
     usuario = _get_usuario_logado(token_data)
-    tipo = _tipo_usuario(usuario)
-    user_id = usuario.get("id")
-    matricula = usuario.get("matricula")
-    email = (usuario.get("email") or "").lower()
 
-    if tipo == "aluno":
-        permitido = (
-            agendamento.get("created_by") == user_id
-            or (matricula and agendamento.get("aluno_matricula") == matricula)
-            or (agendamento.get("alunoEmail") or "").lower() == email
-        )
-    elif tipo == "coordenador":
-        permitido = agendamento.get("coordinator_id") == user_id
-    elif tipo == "suporte":
-        permitido = agendamento.get("created_by") == user_id
-    else:
-        permitido = False
-
-    if not permitido:
+    if not _pode_ver_agendamento(usuario, agendamento):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Você não tem permissão para visualizar este agendamento.",
         )
     return agendamento
+
+
+@router.get("/{agendamento_id}/observacoes", response_model=list[ObservacaoResponse])
+def listar_observacoes(
+    agendamento_id: int,
+    token_data: dict = Depends(verify_firebase_token),
+):
+    """Histórico de desvalidações/cancelamentos com a justificativa de cada autor."""
+    agendamento = _buscar_agendamento(agendamento_id)
+    usuario = _get_usuario_logado(token_data)
+
+    if not _pode_ver_agendamento(usuario, agendamento):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para visualizar as observações deste agendamento.",
+        )
+
+    resultado = (
+        supabase
+        .table("agendamentos_observacoes")
+        .select("*")
+        .eq("agendamento_id", agendamento_id)
+        .order("criado_em", desc=True)
+        .execute()
+    )
+    observacoes = resultado.data or []
+
+    ids_usuarios = {
+        item.get("usuario_id")
+        for item in observacoes
+        if item.get("usuario_id") is not None
+    }
+    nomes: dict[int, Optional[str]] = {}
+    if ids_usuarios:
+        usuarios = (
+            supabase
+            .table("usuarios")
+            .select("id,nome")
+            .in_("id", list(ids_usuarios))
+            .execute()
+        )
+        nomes = {u["id"]: u.get("nome") for u in (usuarios.data or [])}
+
+    return [
+        {**item, "usuario_nome": nomes.get(item.get("usuario_id"))}
+        for item in observacoes
+    ]
 
 
 @router.post("", response_model=AgendamentoResponse, status_code=status.HTTP_201_CREATED)
@@ -200,7 +272,6 @@ def criar_agendamento(
         "nome": agendamento.nome,
         "data": agendamento.data,
         "horario": agendamento.horario,
-        "local": agendamento.local,
         "status": "Pendente",
         "descricao": agendamento.descricao,
         "curso": agendamento.curso,
@@ -239,7 +310,8 @@ def cancelar_agendamento(
             or (ag.get("alunoEmail") or "").lower() == email
         )
     elif tipo == "suporte":
-        pode_editar = ag.get("created_by") == user_id
+        # Suporte pode cancelar qualquer agendamento.
+        pode_editar = True
 
     if not pode_editar:
         raise HTTPException(
@@ -276,7 +348,8 @@ def validar_agendamento(
     if tipo == "coordenador":
         permitido = agendamento.get("coordinator_id") == user_id
     elif tipo == "suporte":
-        permitido = agendamento.get("created_by") == user_id
+        # Suporte pode confirmar qualquer agendamento.
+        permitido = True
     else:
         permitido = False
 
@@ -300,3 +373,89 @@ def validar_agendamento(
             detail="Não foi possível validar o agendamento.",
         )
     return dados_att[0]
+
+
+@router.patch("/{agendamento_id}/desvalidar", response_model=AgendamentoResponse)
+def desvalidar_agendamento(
+    agendamento_id: int,
+    dados: DesvalidarAgendamento,
+    token_data: dict = Depends(verify_firebase_token),
+):
+    """
+    Muda o status para Cancelado ou Redirecionado e registra a justificativa
+    junto com o id do usuário que realizou a alteração (transação no banco).
+    """
+    agendamento = _buscar_agendamento(agendamento_id)
+    usuario = _get_usuario_logado(token_data)
+    tipo = _tipo_usuario(usuario)
+    user_id = usuario.get("id")
+
+    if tipo == "coordenador":
+        permitido = agendamento.get("coordinator_id") == user_id
+    elif tipo == "suporte":
+        permitido = True
+    else:
+        permitido = False
+
+    if not permitido:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para desvalidar este agendamento.",
+        )
+
+    if agendamento.get("status") in STATUS_FINAIS:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Este agendamento já está finalizado.",
+        )
+
+    observacao = dados.observacao.strip()
+    if not observacao:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Informe uma observação justificando a alteração.",
+        )
+
+    try:
+        resposta = supabase.rpc(
+            "desvalidar_agendamento",
+            {
+                "p_agendamento_id": agendamento_id,
+                "p_usuario_id": user_id,
+                "p_status": dados.status,
+                "p_observacao": observacao,
+            },
+        ).execute()
+    except Exception as exc:  # noqa: BLE001 - devolve erro controlado ao frontend
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Não foi possível desvalidar o agendamento: {exc}",
+        ) from exc
+
+    resultado = resposta.data
+    if isinstance(resultado, list):
+        resultado = resultado[0] if resultado else {}
+    resultado = resultado or {}
+
+    if not resultado or not resultado.get("id"):
+        motivo = resultado.get("motivo")
+        if motivo == "finalizado":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Este agendamento já está finalizado.",
+            )
+        if motivo == "nao_encontrado":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Agendamento não encontrado.",
+            )
+        if motivo in ("status_invalido", "observacao_obrigatoria"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Dados inválidos para desvalidar o agendamento.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Não foi possível desvalidar o agendamento.",
+        )
+    return resultado

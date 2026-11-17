@@ -107,7 +107,6 @@ def testar_escrita(perfis: dict[str, dict]) -> None:
         "nome": "Teste automático",
         "data": amanha,
         "horario": "15:00",
-        "local": "Sala de Teste",
         "descricao": "Criado por app/scripts/smoke_test.py",
     }
     criado = client.post("/api/agendamentos", headers=headers(token_aluno), json=payload)

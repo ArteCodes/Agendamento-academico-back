@@ -18,6 +18,10 @@ class AgendamentoCreate(BaseModel):
     horario: str
     local: str
     descricao: Optional[str] = None
+    curso: Optional[str] = None
+    periodo: Optional[str] = None
+    turma: Optional[str] = None
+    telefone: Optional[str] = None
 
 
 class AgendamentoResponse(BaseModel):
@@ -33,6 +37,10 @@ class AgendamentoResponse(BaseModel):
     local: str
     status: str
     descricao: Optional[str] = None
+    curso: Optional[str] = None
+    periodo: Optional[str] = None
+    turma: Optional[str] = None
+    telefone: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -195,6 +203,10 @@ def criar_agendamento(
         "local": agendamento.local,
         "status": "Pendente",
         "descricao": agendamento.descricao,
+        "curso": agendamento.curso,
+        "periodo": agendamento.periodo,
+        "turma": agendamento.turma,
+        "telefone": agendamento.telefone,
     }
 
     resultado = supabase.table("agendamentos").insert(payload).execute()

@@ -21,6 +21,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from app.database import supabase
 from app.dependencies.auth import verify_firebase_token
+from app.services import notificacoes as notificacoes_service
 
 router = APIRouter(prefix="/agendamento-fluxo", tags=["Fluxo de Agendamento"])
 
@@ -294,7 +295,11 @@ def listar_horarios_fluxo(
 ):
     """
     Expande os horários semanais do coordenador nos próximos `dias` dias e
-    classifica cada slot como livre, ocupado ou bloqueado.
+    devolve apenas os slots disponíveis para o usuário logado.
+
+    Horários ocupados ou bloqueados temporariamente por outra pessoa são
+    omitidos da resposta; a reserva do próprio usuário é mantida como
+    'bloqueado_por_mim' para que ele possa retomar o fluxo.
     """
     usuario = _get_usuario_logado(token_data)
     coordenador = _buscar_coordenador(coordinator_id)
@@ -362,16 +367,23 @@ def listar_horarios_fluxo(
                 continue
 
             chave_slot = (chave_dia, hora_inicio)
+
+            # Horários ocupados não são devolvidos: o frontend nem os recebe.
             if chave_slot in ocupados:
-                situacao = "ocupado"
-            elif chave_slot in dono_do_bloqueio:
-                situacao = (
-                    "bloqueado_por_mim"
-                    if dono_do_bloqueio[chave_slot] == usuario.get("id")
-                    else "bloqueado"
-                )
-            else:
-                situacao = "livre"
+                continue
+
+            # Bloqueio temporário de outra pessoa também não é ofertado.
+            if (
+                chave_slot in dono_do_bloqueio
+                and dono_do_bloqueio[chave_slot] != usuario.get("id")
+            ):
+                continue
+
+            situacao = (
+                "bloqueado_por_mim"
+                if chave_slot in dono_do_bloqueio
+                else "livre"
+            )
 
             duracao = int(horario.get("duracao_min") or 0)
             slots.append(
@@ -490,4 +502,9 @@ def confirmar_agendamento(
     if not resultado.get("ok"):
         raise _erro_slot_ocupado()
 
-    return resultado.get("agendamento") or {}
+    agendamento = resultado.get("agendamento") or {}
+    if agendamento.get("id"):
+        # Novo agendamento nasce Pendente: notifica o coordenador responsável
+        # e todos os usuários de suporte.
+        notificacoes_service.notificar_agendamento_pendente(agendamento, usuario)
+    return agendamento

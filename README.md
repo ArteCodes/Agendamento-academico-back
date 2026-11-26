@@ -61,6 +61,49 @@ Abra no navegador:
 http://localhost:8000/docs
 ```
 
+## ✉️ Notificações por e-mail
+
+Além do sino de notificações, o backend pode enviar um e-mail ao aluno quando o
+status do agendamento muda para **Confirmado**, **Cancelado** ou **Redirecionado**.
+O envio é opcional e controlado pelo `app/.env`.
+
+### Desenvolvimento (Mailtrap)
+
+1. Crie um inbox em <https://mailtrap.io> e copie as credenciais SMTP.
+2. Preencha o `app/.env`:
+
+```env
+EMAIL_ENABLED=true
+SMTP_HOST=sandbox.smtp.mailtrap.io
+SMTP_PORT=2525
+SMTP_USER=<usuário do inbox>
+SMTP_PASSWORD=<senha do inbox>
+SMTP_FROM=nao-responder@teste.local
+SMTP_STARTTLS=true
+SMTP_SSL=false
+APP_FRONTEND_URL=http://localhost:5173
+```
+
+3. Teste o envio:
+
+```bash
+app\.venv\Scripts\python.exe app\scripts\testar_email.py --para aluno@teste.com
+```
+
+### Produção
+
+Troque as variáveis SMTP pelas credenciais do servidor institucional. Para a
+porta 465 use `SMTP_SSL=true` e `SMTP_STARTTLS=false`.
+
+### Registro de envios
+
+Cada tentativa fica registrada em `public.notificacoes_email`
+(`supabase/006_notificacoes_email.sql`) com `status_envio`
+(`pendente`, `enviado` ou `falha`), erro e data de envio.
+
+Se `EMAIL_ENABLED=false` ou faltar `SMTP_HOST`/`SMTP_FROM`, o sistema continua
+funcionando apenas com as notificações internas.
+
 ## 📁 Estrutura do Projeto
 ```
 app/

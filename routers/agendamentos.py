@@ -1,13 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 from app.database import supabase
 from app.dependencies.auth import verify_firebase_token
+from app.services import notificacoes as notificacoes_service
 
 router = APIRouter(prefix="/agendamentos", tags=["Agendamentos"])
 
-STATUS_FINAIS = ("Cancelado", "Redirecionado")
+STATUS_FINAIS = ("Cancelado", "Redirecionado", "Concluído")
 
 
 class AgendamentoCreate(BaseModel):
@@ -48,6 +49,11 @@ class AgendamentoResponse(BaseModel):
 
 class DesvalidarAgendamento(BaseModel):
     status: Literal["Cancelado", "Redirecionado"]
+    observacao: str = Field(min_length=1, max_length=2000)
+
+
+class AlterarStatusAgendamento(BaseModel):
+    status: Literal["Pendente", "Confirmado", "Concluído", "Cancelado", "Redirecionado"]
     observacao: str = Field(min_length=1, max_length=2000)
 
 
@@ -126,6 +132,21 @@ def _buscar_agendamento(agendamento_id: int) -> dict:
     return dados[0]
 
 
+def _pode_gerenciar_agendamento(usuario: dict, agendamento: dict) -> bool:
+    """
+    Regra de gestão (confirmar/alterar status):
+    - suporte: qualquer agendamento;
+    - coordenador: apenas os destinados a ele (coordinator_id);
+    - aluno: não gerencia.
+    """
+    tipo = _tipo_usuario(usuario)
+    if tipo == "suporte":
+        return True
+    if tipo == "coordenador":
+        return agendamento.get("coordinator_id") == usuario.get("id")
+    return False
+
+
 def _pode_ver_agendamento(usuario: dict, agendamento: dict) -> bool:
     """
     Regra de visibilidade:
@@ -149,6 +170,85 @@ def _pode_ver_agendamento(usuario: dict, agendamento: dict) -> bool:
     if tipo == "coordenador":
         return agendamento.get("coordinator_id") == user_id
     return False
+
+
+def _resultado_rpc(resposta) -> dict:
+    resultado = resposta.data
+    if isinstance(resultado, list):
+        resultado = resultado[0] if resultado else {}
+    return resultado or {}
+
+
+def _executar_alteracao_status(
+    agendamento_id: int,
+    usuario: dict,
+    novo_status: str,
+    observacao: str,
+) -> dict:
+    """Executa a RPC de alteração de status e traduz os erros para HTTP."""
+    try:
+        resposta = supabase.rpc(
+            "alterar_status_agendamento",
+            {
+                "p_agendamento_id": agendamento_id,
+                "p_usuario_id": usuario.get("id"),
+                "p_status": novo_status,
+                "p_observacao": observacao,
+            },
+        ).execute()
+    except Exception as exc:  # noqa: BLE001 - devolve erro controlado ao frontend
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Não foi possível alterar o status do agendamento: {exc}",
+        ) from exc
+
+    resultado = _resultado_rpc(resposta)
+    if resultado.get("id"):
+        return resultado
+
+    motivo = resultado.get("motivo")
+    if motivo == "nao_encontrado":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agendamento não encontrado.",
+        )
+    if motivo == "mesmo_status":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="O novo status deve ser diferente do status atual.",
+        )
+    if motivo == "finalizado":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Este agendamento está concluído e não pode ser alterado.",
+        )
+    if motivo == "transicao_invalida":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Só é possível concluir um agendamento confirmado.",
+        )
+    if motivo == "slot_ocupado":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "O horário deste agendamento já está ocupado por outro "
+                "agendamento ativo. Cancele o outro agendamento antes de reativar."
+            ),
+        )
+    if motivo in ("status_invalido", "observacao_obrigatoria"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Dados inválidos para alterar o status do agendamento.",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Não foi possível alterar o status do agendamento.",
+    )
+
+
+def _observacao_automatica(usuario: dict, acao: str) -> str:
+    nome = (usuario.get("nome") or usuario.get("email") or "Usuário").strip()
+    return f"{acao} por {nome}."
 
 
 @router.get("", response_model=list[AgendamentoResponse])
@@ -287,12 +387,15 @@ def criar_agendamento(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Não foi possível criar o agendamento.",
         )
-    return dados[0]
+    criado = dados[0]
+    notificacoes_service.notificar_agendamento_pendente(criado, usuario)
+    return criado
 
 
 @router.patch("/{agendamento_id}", response_model=AgendamentoResponse)
 def cancelar_agendamento(
     agendamento_id: int,
+    background: BackgroundTasks,
     token_data: dict = Depends(verify_firebase_token),
 ):
     ag = _buscar_agendamento(agendamento_id)
@@ -309,6 +412,9 @@ def cancelar_agendamento(
             or (matricula and ag.get("aluno_matricula") == matricula)
             or (ag.get("alunoEmail") or "").lower() == email
         )
+    elif tipo == "coordenador":
+        # Coordenador cancela apenas os agendamentos destinados a ele.
+        pode_editar = ag.get("coordinator_id") == user_id
     elif tipo == "suporte":
         # Suporte pode cancelar qualquer agendamento.
         pode_editar = True
@@ -319,66 +425,74 @@ def cancelar_agendamento(
             detail="Você não tem permissão para cancelar este agendamento.",
         )
 
-    atualizado = (
-        supabase
-        .table("agendamentos")
-        .update({"status": "Cancelado"})
-        .eq("id", agendamento_id)
-        .execute()
-    )
-    dados_att = atualizado.data or []
-    if not dados_att:
+    if ag.get("status") in STATUS_FINAIS:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Não foi possível cancelar o agendamento.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Este agendamento já está finalizado.",
         )
-    return dados_att[0]
+
+    observacao = _observacao_automatica(usuario, "Cancelado")
+    resultado = _executar_alteracao_status(
+        agendamento_id,
+        usuario,
+        "Cancelado",
+        observacao,
+    )
+    notificacoes_service.notificar_mudanca_status(
+        agendamento=ag,
+        status_anterior=ag.get("status"),
+        status_novo="Cancelado",
+        ator=usuario,
+        background=background,
+        observacao=observacao,
+    )
+    return resultado
 
 
 @router.patch("/{agendamento_id}/validar", response_model=AgendamentoResponse)
 def validar_agendamento(
     agendamento_id: int,
+    background: BackgroundTasks,
     token_data: dict = Depends(verify_firebase_token),
 ):
     agendamento = _buscar_agendamento(agendamento_id)
     usuario = _get_usuario_logado(token_data)
-    tipo = _tipo_usuario(usuario)
-    user_id = usuario.get("id")
 
-    if tipo == "coordenador":
-        permitido = agendamento.get("coordinator_id") == user_id
-    elif tipo == "suporte":
-        # Suporte pode confirmar qualquer agendamento.
-        permitido = True
-    else:
-        permitido = False
-
-    if not permitido:
+    if not _pode_gerenciar_agendamento(usuario, agendamento):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Você não tem permissão para validar este agendamento.",
         )
 
-    atualizado = (
-        supabase
-        .table("agendamentos")
-        .update({"status": "Confirmado"})
-        .eq("id", agendamento_id)
-        .execute()
-    )
-    dados_att = atualizado.data or []
-    if not dados_att:
+    if agendamento.get("status") != "Pendente":
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Não foi possível validar o agendamento.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Só é possível confirmar agendamentos pendentes.",
         )
-    return dados_att[0]
+
+    observacao = _observacao_automatica(usuario, "Confirmado")
+    resultado = _executar_alteracao_status(
+        agendamento_id,
+        usuario,
+        "Confirmado",
+        observacao,
+    )
+    notificacoes_service.notificar_mudanca_status(
+        agendamento=agendamento,
+        status_anterior="Pendente",
+        status_novo="Confirmado",
+        ator=usuario,
+        background=background,
+        observacao=observacao,
+    )
+    return resultado
 
 
 @router.patch("/{agendamento_id}/desvalidar", response_model=AgendamentoResponse)
 def desvalidar_agendamento(
     agendamento_id: int,
     dados: DesvalidarAgendamento,
+    background: BackgroundTasks,
     token_data: dict = Depends(verify_firebase_token),
 ):
     """
@@ -387,17 +501,9 @@ def desvalidar_agendamento(
     """
     agendamento = _buscar_agendamento(agendamento_id)
     usuario = _get_usuario_logado(token_data)
-    tipo = _tipo_usuario(usuario)
     user_id = usuario.get("id")
 
-    if tipo == "coordenador":
-        permitido = agendamento.get("coordinator_id") == user_id
-    elif tipo == "suporte":
-        permitido = True
-    else:
-        permitido = False
-
-    if not permitido:
+    if not _pode_gerenciar_agendamento(usuario, agendamento):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Você não tem permissão para desvalidar este agendamento.",
@@ -458,4 +564,103 @@ def desvalidar_agendamento(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Não foi possível desvalidar o agendamento.",
         )
+    notificacoes_service.notificar_mudanca_status(
+        agendamento=agendamento,
+        status_anterior=agendamento.get("status"),
+        status_novo=dados.status,
+        ator=usuario,
+        background=background,
+        observacao=observacao,
+    )
+    return resultado
+
+
+@router.patch("/{agendamento_id}/status", response_model=AgendamentoResponse)
+def alterar_status_agendamento(
+    agendamento_id: int,
+    dados: AlterarStatusAgendamento,
+    background: BackgroundTasks,
+    token_data: dict = Depends(verify_firebase_token),
+):
+    """
+    Altera o status de um agendamento (inclusive reverter Cancelado/Redirecionado)
+    e registra a justificativa no histórico de alterações.
+    """
+    agendamento = _buscar_agendamento(agendamento_id)
+    usuario = _get_usuario_logado(token_data)
+    user_id = usuario.get("id")
+
+    if not _pode_gerenciar_agendamento(usuario, agendamento):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para alterar o status deste agendamento.",
+        )
+
+    if dados.status == agendamento.get("status"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="O novo status deve ser diferente do status atual.",
+        )
+
+    observacao = dados.observacao.strip()
+    if not observacao:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Informe uma observação justificando a alteração.",
+        )
+
+    resultado = _executar_alteracao_status(
+        agendamento_id,
+        usuario,
+        dados.status,
+        observacao,
+    )
+    notificacoes_service.notificar_mudanca_status(
+        agendamento=agendamento,
+        status_anterior=agendamento.get("status"),
+        status_novo=dados.status,
+        ator=usuario,
+        background=background,
+        observacao=observacao,
+    )
+    return resultado
+
+
+@router.patch("/{agendamento_id}/concluir", response_model=AgendamentoResponse)
+def concluir_agendamento(
+    agendamento_id: int,
+    background: BackgroundTasks,
+    token_data: dict = Depends(verify_firebase_token),
+):
+    """Marca um agendamento confirmado como atendimento realizado (definitivo)."""
+    agendamento = _buscar_agendamento(agendamento_id)
+    usuario = _get_usuario_logado(token_data)
+
+    if not _pode_gerenciar_agendamento(usuario, agendamento):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para concluir este agendamento.",
+        )
+
+    if agendamento.get("status") != "Confirmado":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Só é possível concluir um agendamento confirmado.",
+        )
+
+    observacao = _observacao_automatica(usuario, "Atendimento marcado como realizado")
+    resultado = _executar_alteracao_status(
+        agendamento_id,
+        usuario,
+        "Concluído",
+        observacao,
+    )
+    notificacoes_service.notificar_mudanca_status(
+        agendamento=agendamento,
+        status_anterior="Confirmado",
+        status_novo="Concluído",
+        ator=usuario,
+        background=background,
+        observacao=observacao,
+    )
     return resultado
